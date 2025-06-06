@@ -64,6 +64,28 @@ ggml_type_enum = {
 ggml_type_enum_invert = {v: k for k, v in ggml_type_enum.items()}
 
 
+def is_huggingface_repo_id(input_str):
+    """Check if input looks like a HuggingFace repo ID rather than a local path."""
+    # HuggingFace repo IDs are typically in format: username/repo or just repo
+    # They don't start with / or contain backslashes, and don't have file extensions
+    input_str = input_str.strip()
+    
+    # If it starts with / or contains \, it's likely a local path
+    if input_str.startswith('/') or '\\' in input_str:
+        return False
+    
+    # If it contains : (like C:) it's likely a Windows path
+    if ':' in input_str and len(input_str.split(':')) == 2 and len(input_str.split(':')[0]) == 1:
+        return False
+    
+    # If it exists as a local directory, treat it as local
+    if Path(input_str).exists():
+        return False
+    
+    # Otherwise, assume it's a repo ID
+    return True
+
+
 def streamlit_main():
     st.title("GGUF_GUI")
     st.header("Step 1: Convert Safetensor to GGUF")
@@ -76,7 +98,7 @@ def streamlit_main():
     # uploaded_file = st.file_uploader("Select Directory")
 
     # Create a text input widget for manual entry
-    manual_entry = Path(st.text_input("Enter Directory Path or repo", placeholder="/path/to/safetensors/ or username_or_org/repo_name"))
+    manual_entry_str = st.text_input("Enter Directory Path or repo", placeholder="/path/to/safetensors/ or username_or_org/repo_name")
     root_output_path = Path(st.text_input("Enter path to save your work to.", placeholder="/path/to/files/"))
     outtype = "0"
     outfile = ""
@@ -87,51 +109,119 @@ def streamlit_main():
     outfile_input = st.text_input("Output file name (optional)", "")
     vocab_only = st.checkbox("Extract only the vocab")
     big_endian = st.checkbox("Model is executed on big endian machine")
+    
     # Button to trigger the main function
     if st.button("Run Conversion"):
+        if not manual_entry_str.strip():
+            st.error("Please enter a directory path or repo ID")
+            return
+        
+        if not root_output_path or not str(root_output_path).strip():
+            st.error("Please enter an output path")
+            return
+        
         try:
             with st.spinner(f"Converting Safetensors to {outtype}"):
-                # Define the arguments you want to pass
-                safetensor_dl_loc = str(root_output_path.joinpath(manual_entry.name))
-                st.warning(f"Using input directory/repo id: {safetensor_dl_loc}")
-                try:
-                    safetensor_dl_loc = snapshot_download(repo_id=str(manual_entry), local_files_only=False, local_dir=str(root_output_path.joinpath(manual_entry.name)))
-                    st.success(f"Model downloaded to {safetensor_dl_loc}")
-                except Exception as e:
-                    print(e)
-                outfile = f"{str(root_output_path)}/{manual_entry.name}_{outtype}.gguf"
+                # Determine if input is a local path or HuggingFace repo ID
+                if is_huggingface_repo_id(manual_entry_str):
+                    # It's a HuggingFace repo ID - download it
+                    st.info(f"Detected HuggingFace repo ID: {manual_entry_str}")
+                    repo_name = manual_entry_str.split('/')[-1]  # Get the last part as folder name
+                    local_download_path = root_output_path / repo_name
+                    
+                    try:
+                        safetensor_dl_loc = snapshot_download(
+                            repo_id=manual_entry_str, 
+                            local_files_only=False, 
+                            local_dir=str(local_download_path)
+                        )
+                        st.success(f"Model downloaded to {safetensor_dl_loc}")
+                    except Exception as e:
+                        st.error(f"Failed to download from HuggingFace: {e}")
+                        return
+                else:
+                    # It's a local path - use it directly
+                    manual_entry_path = Path(manual_entry_str)
+                    if not manual_entry_path.exists():
+                        st.error(f"Local directory does not exist: {manual_entry_str}")
+                        return
+                    
+                    if not manual_entry_path.is_dir():
+                        st.error(f"Path is not a directory: {manual_entry_str}")
+                        return
+                    
+                    # Check if it contains model files
+                    model_files = list(manual_entry_path.glob("*.safetensors")) + \
+                                 list(manual_entry_path.glob("*.bin")) + \
+                                 list(manual_entry_path.glob("config.json"))
+                    
+                    if not model_files:
+                        st.error(f"No model files found in directory: {manual_entry_str}")
+                        return
+                    
+                    safetensor_dl_loc = str(manual_entry_path)
+                    st.success(f"Using local directory: {safetensor_dl_loc}")
+                
+                # Generate output filename
+                if is_huggingface_repo_id(manual_entry_str):
+                    model_name = manual_entry_str.split('/')[-1]
+                else:
+                    model_name = Path(manual_entry_str).name
+                
+                outfile = f"{root_output_path}/{model_name}_{outtype}.gguf"
                 if vocab_only:
                     outfile = outfile.replace(".gguf", "_vocab_only.gguf")
                 if big_endian:
                     outfile = outfile.replace(".gguf", "_big_endian.gguf")
-                st_to_gguf_output = f"{root_output_path.joinpath(manual_entry.name)}.gguf" or outfile
-                st.session_state['st_to_gguf_outfile'] = st_to_gguf_output
+                
+                # Store the output file for the next step
+                st.session_state['st_to_gguf_outfile'] = outfile
 
+                # Prepare arguments for the conversion script
                 args = [
-                    "--outfile",
-                    st_to_gguf_output,
-                    "--outtype",
-                    outtype,
-                    "--verbose" if verbose else "",
-                    "--vocab-only" if vocab_only else "",
-                    "--bigendian" if big_endian else "",
-                    safetensor_dl_loc,
+                    "--outfile", outfile,
+                    "--outtype", outtype,
                 ]
-                args = [arg for arg in args if arg]  # Remove empty arguments
-                # Call the main function with the arguments
-                # Execute the script
-                subprocess.run(["python", script_path] + args)
-                st.success("Conversion completed successfully!")
-                st.success(f"Wrote file to: {st_to_gguf_output}")
+                
+                if verbose:
+                    args.append("--verbose")
+                if vocab_only:
+                    args.append("--vocab-only")
+                if big_endian:
+                    args.append("--bigendian")
+                if awq_path:
+                    args.extend(["--awq-path", awq_path])
+                
+                # Add the input directory as the last argument
+                args.append(safetensor_dl_loc)
+                
+                st.info(f"Running conversion command: python {script_path} {' '.join(args)}")
+                
+                # Execute the conversion script
+                result = subprocess.run(["python", script_path] + args, capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    st.success("Conversion completed successfully!")
+                    st.success(f"Wrote file to: {outfile}")
+                else:
+                    st.error(f"Conversion failed with return code {result.returncode}")
+                    if result.stderr:
+                        st.error(f"Error output: {result.stderr}")
+                    if result.stdout:
+                        st.info(f"Standard output: {result.stdout}")
+                        
         except Exception as e:
             st.error(f"An error occurred: {e}")
+            import traceback
+            st.error(f"Traceback: {traceback.format_exc()}")
+    
     # Display header
     st.header("Step 2: Quantize FP32/16")
     # Use quantize: ./quantize
     # Create a dropdown selector
     ggml_selected_type = st.selectbox("Select a Quantization Type", list(ggml_type_enum.keys()))
     # Create a text input for the outfile
-    outfile_ggml = st.text_input("Enter file path to your FP 32/16 GGUF", st.session_state.get('st_to_gguf_outfile'), placeholder="/path/to/input/model.gguf")
+    outfile_ggml = st.text_input("Enter file path to your FP 32/16 GGUF", st.session_state.get('st_to_gguf_outfile', ''), placeholder="/path/to/input/model.gguf")
     # Optional options
     with st.expander("Optional Parameters", expanded=False):
         model_quant = st.text_input("Quantized Model File Path (model-quant.gguf, optional)", "")
@@ -144,7 +234,7 @@ def streamlit_main():
         output_tensor_type = st.text_input("Output Tensor Type (--output-tensor-type)", "")
         token_embedding_type = st.text_input("Token Embedding Type (--token-embedding-type)", "")
         override_kv = st.text_area("Override KV (--override-kv)", "")
-        nthreads = st.number_input("Number of Threads (nthreads)", min_value=1, step=1)
+        nthreads = st.number_input("Number of Threads (nthreads)", min_value=1, step=1, value=DEFAULT_CONCURRENCY)
 
     # Ensure --include-weights and --exclude-weights are not used together
     if include_weights and exclude_weights:
@@ -160,9 +250,9 @@ def streamlit_main():
         with st.expander("iMatrix Parameters", expanded=True):
             # Mandatory options
             training_data = st.text_input("Training Data File Path (-f)", "")
-            imatrix_output_file = st.text_input("Output File Path (-o)", root_output_path.joinpath("imatrix.dat"))
+            imatrix_output_file = st.text_input("Output File Path (-o)", str(root_output_path / "imatrix.dat") if root_output_path else "imatrix.dat")
             verbosity_level = st.selectbox("Verbosity Level (--verbosity)", [None, "0", "1", "2", "3"], index=0)
-            num_chunks = st.number_input("Number of Chunks (-ofreq)", min_value=1, step=1)
+            num_chunks = st.number_input("Number of Chunks (-ofreq)", min_value=1, step=1, value=10)
             ow_option = st.selectbox("Overwrite Option (-ow)", [None, "0", "1"], index=0)
 
             # Add any other common params here
@@ -171,17 +261,27 @@ def streamlit_main():
     # Check if the "Quantize" button is clicked
     if st.button("Quantize"):
         # Check if outfile is provided
-        if outfile_ggml:
-            with st.spinner(f"Converting Safetensors to {ggml_selected_type}"):
+        if not outfile_ggml:
+            st.warning("Please enter an input GGUF file path.")
+            return
+            
+        if not Path(outfile_ggml).exists():
+            st.error(f"Input GGUF file does not exist: {outfile_ggml}")
+            return
+            
+        with st.spinner(f"Converting to {ggml_selected_type}"):
+            try:
                 if imatrix:
-                    # Construct the command
-                    cmd = ["./llama.cpp/llama-imatrix"]
-                    if outfile_ggml:
-                        cmd.extend(["-m", outfile_ggml])
-                    if training_data:
-                        cmd.extend(["-f", training_data])
-                    if imatrix_output_file:
-                        cmd.extend(["-o", imatrix_output_file])
+                    if not training_data:
+                        st.error("Training data file is required for iMatrix")
+                        return
+                        
+                    # Construct the imatrix command
+                    cmd = ["./llama.cpp/build/bin/llama-imatrix"]
+                    cmd.extend(["-m", outfile_ggml])
+                    cmd.extend(["-f", training_data])
+                    cmd.extend(["-o", imatrix_output_file])
+                    
                     if verbosity_level:
                         cmd.extend(["--verbosity", verbosity_level])
                     if num_chunks:
@@ -190,15 +290,25 @@ def streamlit_main():
                         cmd.extend(["-ow", ow_option])
                     if other_params:
                         cmd.extend(other_params.split())
-                    print("#####################imatrix############################")
-                    result = subprocess.run(cmd, capture_output=False, text=False)
-                    # st.text_area("Command Output", result.stdout)
-                    # st.text_area("Command Errors", result.stderr)
+                    
+                    st.info(f"Running iMatrix: {' '.join(cmd)}")
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    
+                    if result.returncode != 0:
+                        st.error(f"iMatrix failed: {result.stderr}")
+                        return
+                    else:
+                        st.success("iMatrix completed successfully!")
 
-                # Construct the command
-                cmd = ["./llama.cpp/llama-quantize"]
-                if imatrix:
-                    cmd.extend(["--imatrix", imatrix_output_file or imatrix_file])
+                # Construct the quantization command
+                cmd = ["./llama.cpp/build/bin/llama-quantize"]
+                
+                # Add optional parameters
+                if imatrix and imatrix_output_file:
+                    cmd.extend(["--imatrix", imatrix_output_file])
+                elif imatrix_file:
+                    cmd.extend(["--imatrix", imatrix_file])
+                    
                 if allow_requantize:
                     cmd.append("--allow-requantize")
                 if leave_output_tensor:
@@ -217,30 +327,37 @@ def streamlit_main():
                     for kv in override_kv.split('\n'):
                         if kv.strip():
                             cmd.extend(["--override-kv", kv.strip()])
-                infile_ggml = (outfile_ggml or st.session_state.get('st_to_gguf_outfile'))
-                outfile_ggml = infile_ggml.replace(".gguf", f"_{ggml_selected_type}.gguf")
 
-                if infile_ggml:
-                    cmd.append(infile_ggml)
-                if outfile_ggml:
-                    cmd.append(outfile_ggml)
-                if model_quant:
-                    cmd.append(model_quant)
+                # Add required parameters
+                infile_ggml = outfile_ggml
+                outfile_ggml_quantized = infile_ggml.replace(".gguf", f"_{ggml_selected_type}.gguf")
+
+                cmd.append(infile_ggml)
+                cmd.append(outfile_ggml_quantized)
                 cmd.append(str(ggml_type_enum[ggml_selected_type]))
+                
                 if nthreads:
                     cmd.append(str(nthreads))
-                print("#####################Quantize############################")
-                # Quantize the model
-                result = subprocess.run(cmd, capture_output=False, text=False)
-                # st.text_area("Command Output", result)
-                # st.text_area("Command Errors", result.stderr)
 
-                # ######
-                st.success(f"""Quantizaion completed successfully!""")
-                st.success(f"""Output quantized model to: {outfile_ggml}""")
-
-        else:
-            st.warning("Please enter an output file name.")
+                st.info(f"Running quantization: {' '.join(cmd)}")
+                
+                # Run quantization
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    st.success("Quantization completed successfully!")
+                    st.success(f"Output quantized model to: {outfile_ggml_quantized}")
+                else:
+                    st.error(f"Quantization failed with return code {result.returncode}")
+                    if result.stderr:
+                        st.error(f"Error output: {result.stderr}")
+                    if result.stdout:
+                        st.info(f"Standard output: {result.stdout}")
+                        
+            except Exception as e:
+                st.error(f"An error occurred during quantization: {e}")
+                import traceback
+                st.error(f"Traceback: {traceback.format_exc()}")
 
 
 if __name__ == "__main__":
